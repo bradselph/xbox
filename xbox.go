@@ -1,17 +1,3 @@
-// Copyright 2013 Kyle Lemons.  All rights reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package main
 
 import (
@@ -20,484 +6,269 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"reflect"
 	"time"
 
-	"github.com/kylelemons/gousb/usb"
+	"github.com/google/gousb"
 )
 
 var (
-	readonly = flag.Bool("readonly", false, "Only read from the controller")
-	debug    = flag.Int("debug", 0, "USB debugging control")
+	pollingFrequency = flag.Int("freq", 500, "Polling frequency in Hz")
+	readonly         = flag.Bool("readonly", false, "Only read from the controller")
+	debug            = flag.Int("debug", 0, "USB debugging control")
 )
 
-type modelInfo struct {
-	config, iface, setup, endIn, endOut uint8
-	kind                                string
+const (
+	VendorMicrosoft  = 0x045e
+	ProductXboxOne   = 0x02d1
+	ProductXboxOneS  = 0x02dd
+	ProductXboxOneX  = 0x02ea
+	ProductXboxElite = 0x02e3
+)
+
+type Controller struct {
+	device *gousb.Device
+	config *gousb.Config
+	intf   *gousb.Interface
+	in     *gousb.InEndpoint
+	out    *gousb.OutEndpoint
+}
+
+type ControllerState struct {
+	A, B, X, Y, RB, LB, UP, RIGHT, DOWN, LEFT, LS, RS, MENU, VIEW, GUIDE, SHARE bool
+	LT, RT, LEFTX, LEFTY, RIGHTX, RIGHTY                                        float32
+	LastState                                                                   *ControllerState
+}
+
+func NewController() (*Controller, error) {
+	ctx := gousb.NewContext()
+
+	for _, pid := range []gousb.ID{ProductXboxOne, ProductXboxOneS, ProductXboxOneX, ProductXboxElite} {
+		device, err := ctx.OpenDeviceWithVIDPID(VendorMicrosoft, pid)
+		if err != nil {
+			continue
+		}
+
+		if device == nil {
+			continue
+		}
+
+		log.Printf("Found Xbox controller with PID: %#x", pid)
+
+		config, err := device.Config(1)
+		if err != nil {
+			device.Close()
+			continue
+		}
+
+		intf, err := config.Interface(0, 0)
+		if err != nil {
+			config.Close()
+			device.Close()
+			continue
+		}
+
+		in, err := intf.InEndpoint(1)
+		if err != nil {
+			intf.Close()
+			config.Close()
+			device.Close()
+			continue
+		}
+
+		out, err := intf.OutEndpoint(1)
+		if err != nil {
+			intf.Close()
+			config.Close()
+			device.Close()
+			continue
+		}
+
+		return &Controller{
+			device: device,
+			config: config,
+			intf:   intf,
+			in:     in,
+			out:    out,
+		}, nil
+	}
+
+	return nil, fmt.Errorf("no compatible Xbox controller found")
+}
+
+func (c *Controller) Close() {
+	if c.intf != nil {
+		c.intf.Close()
+	}
+	if c.config != nil {
+		c.config.Close()
+	}
+	if c.device != nil {
+		c.device.Close()
+	}
+}
+
+func (c *Controller) Initialize() error {
+	init := []byte{0x05, 0x20}
+	_, err := c.out.Write(init)
+	if err != nil {
+		return fmt.Errorf("initialization failed: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	return nil
+}
+
+func (c *Controller) ReadState() (*ControllerState, error) {
+	buf := make([]byte, 64)
+	n, err := c.in.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+
+	if n < 16 {
+		return nil, fmt.Errorf("short read: %d bytes", n)
+	}
+
+	state := &ControllerState{}
+
+	switch buf[0] {
+	case 0x20:
+		btn1 := buf[3]
+		btn2 := buf[4]
+
+		state.A = btn1&0x10 != 0
+		state.B = btn1&0x40 != 0
+		state.X = btn1&0x20 != 0
+		state.Y = btn1&0x80 != 0
+		state.MENU = btn1&0x04 != 0
+		state.VIEW = btn1&0x08 != 0
+		state.SHARE = btn1&0x01 != 0
+		state.UP = btn2&0x01 != 0
+		state.DOWN = btn2&0x02 != 0
+		state.LEFT = btn2&0x04 != 0
+		state.RIGHT = btn2&0x08 != 0
+		state.LB = btn2&0x10 != 0
+		state.RB = btn2&0x20 != 0
+		state.LS = btn2&0x40 != 0
+		state.RS = btn2&0x80 != 0
+		lt := binary.LittleEndian.Uint16(buf[5:7])
+		rt := binary.LittleEndian.Uint16(buf[7:9])
+		state.LT = float32(lt) / 1023.0
+		state.RT = float32(rt) / 1023.0
+		lx := int16(binary.LittleEndian.Uint16(buf[9:11]))
+		ly := int16(binary.LittleEndian.Uint16(buf[11:13]))
+		rx := int16(binary.LittleEndian.Uint16(buf[13:15]))
+		ry := int16(binary.LittleEndian.Uint16(buf[15:17]))
+		state.LEFTX = float32(lx) / 32768.0
+		state.LEFTY = float32(ly) / 32768.0
+		state.RIGHTX = float32(rx) / 32768.0
+		state.RIGHTY = float32(ry) / 32768.0
+
+		const deadzone = 0.1
+		if math.Abs(float64(state.LEFTX)) < deadzone {
+			state.LEFTX = 0
+		}
+		if math.Abs(float64(state.LEFTY)) < deadzone {
+			state.LEFTY = 0
+		}
+		if math.Abs(float64(state.RIGHTX)) < deadzone {
+			state.RIGHTX = 0
+		}
+		if math.Abs(float64(state.RIGHTY)) < deadzone {
+			state.RIGHTY = 0
+		}
+
+	case 0x07:
+		if len(buf) >= 4 {
+			state.GUIDE = buf[2]&0x01 != 0
+		}
+	}
+
+	return state, nil
+}
+
+func setPollingFrequency(hz int) time.Duration {
+	if hz <= 0 {
+		return 16 * time.Millisecond
+	}
+	return time.Duration(1e9/hz) * time.Nanosecond
+}
+
+func logStateChanges(current, last *ControllerState) {
+	if last == nil {
+		return
+	}
+
+	val := reflect.ValueOf(*current)
+	lastVal := reflect.ValueOf(*last)
+	t := val.Type()
+
+	for i := 0; i < val.NumField(); i++ {
+		field := t.Field(i)
+
+		if field.Type.Kind() != reflect.Bool || field.Name == "LastState" {
+			continue
+		}
+
+		currentValue := val.Field(i).Bool()
+		lastValue := lastVal.Field(i).Bool()
+
+		if currentValue != lastValue {
+			if currentValue {
+				log.Printf("%s pressed", field.Name)
+			} else {
+				log.Printf("%s released", field.Name)
+			}
+		}
+	}
+
+	const analogThreshold = 0.1
+	if math.Abs(float64(current.LEFTX-last.LEFTX)) > analogThreshold ||
+		math.Abs(float64(current.LEFTY-last.LEFTY)) > analogThreshold {
+		log.Printf("Left stick: %.2f, %.2f", current.LEFTX, current.LEFTY)
+	}
+
+	if math.Abs(float64(current.RIGHTX-last.RIGHTX)) > analogThreshold ||
+		math.Abs(float64(current.RIGHTY-last.RIGHTY)) > analogThreshold {
+		log.Printf("Right stick: %.2f, %.2f", current.RIGHTX, current.RIGHTY)
+	}
+
+	if math.Abs(float64(current.LT-last.LT)) > analogThreshold ||
+		math.Abs(float64(current.RT-last.RT)) > analogThreshold {
+		log.Printf("Triggers: LT=%.2f RT=%.2f", current.LT, current.RT)
+	}
 }
 
 func main() {
 	flag.Parse()
 
-	ctx := usb.NewContext()
-	defer ctx.Close()
-
-	if *debug != 0 {
-		ctx.Debug(*debug)
-	}
-
-	var model modelInfo
-
-	devs, err := ctx.ListDevices(func(desc *usb.Descriptor) bool {
-		switch {
-		case desc.Vendor == 0x045e && desc.Product == 0x028e:
-			log.Printf("Found standard Microsoft controller")
-			/*
-			   250.006 045e:028e Xbox360 Controller (Microsoft Corp.)
-			     Protocol: Vendor Specific Class (Vendor Specific Subclass) Vendor Specific Protocol
-			     Config 01:
-			       --------------
-			       Interface 00 Setup 00
-			         Vendor Specific Class
-			         Endpoint 1 IN  interrupt - unsynchronized data [32 0]
-			         Endpoint 1 OUT interrupt - unsynchronized data [32 0]
-			       --------------
-			       Interface 01 Setup 00
-			         Vendor Specific Class
-			         Endpoint 2 IN  interrupt - unsynchronized data [32 0]
-			         Endpoint 2 OUT interrupt - unsynchronized data [32 0]
-			         Endpoint 3 IN  interrupt - unsynchronized data [32 0]
-			         Endpoint 3 OUT interrupt - unsynchronized data [32 0]
-			       --------------
-			       Interface 02 Setup 00
-			         Vendor Specific Class
-			         Endpoint 0 IN  interrupt - unsynchronized data [32 0]
-			       --------------
-			       Interface 03 Setup 00
-			         Vendor Specific Class
-			       --------------
-			*/
-			model = modelInfo{1, 0, 0, 1, 1, "360"}
-
-		case desc.Vendor == 0x045e && desc.Product == 0x02d1:
-			log.Printf("Found Microsoft Xbox One controller")
-			/*
-			   250.006 045e:02d1 Unknown (Microsoft Corp.)
-			     Protocol: Vendor Specific Class
-			     Config 01:
-			       --------------
-			       Interface 00 Setup 00
-			         Vendor Specific Class
-			         Endpoint 1 OUT interrupt - unsynchronized data [64 0]
-			         Endpoint 1 IN  interrupt - unsynchronized data [64 0]
-			       --------------
-			       Interface 01 Setup 00
-			         Vendor Specific Class
-			       Interface 01 Setup 01
-			         Vendor Specific Class
-			         Endpoint 2 OUT isochronous - unsynchronized data [228 0]
-			         Endpoint 2 IN  isochronous - unsynchronized data [228 0]
-			       --------------
-			       Interface 02 Setup 00
-			         Vendor Specific Class
-			       Interface 02 Setup 01
-			         Vendor Specific Class
-			         Endpoint 3 OUT bulk - unsynchronized data [64 0]
-			         Endpoint 3 IN  bulk - unsynchronized data [64 0]
-			       --------------
-			*/
-			model = modelInfo{1, 0, 0, 1, 1, "one"}
-
-		case desc.Vendor == 0x1689 && desc.Product == 0xfd00:
-			log.Printf("Found Razer Onza Tournament controller")
-			/*
-				250.006 1689:fd00 Unknown 1689:fd00
-				  Protocol: Vendor Specific Class (Vendor Specific Subclass) Vendor Specific Protocol
-				  Config 01:
-				    --------------
-				    Interface 00 Setup 00
-				      Vendor Specific Class
-				      Endpoint 1 IN  interrupt - unsynchronized data [32 0]
-				      Endpoint 2 OUT interrupt - unsynchronized data [32 0]
-				    --------------
-				    Interface 01 Setup 00
-				      Vendor Specific Class
-				      Endpoint 3 IN  interrupt - unsynchronized data [32 0]
-				      Endpoint 0 OUT interrupt - unsynchronized data [32 0]
-				      Endpoint 1 IN  interrupt - unsynchronized data [32 0]
-				      Endpoint 1 OUT interrupt - unsynchronized data [32 0]
-				    --------------
-				    Interface 02 Setup 00
-				      Vendor Specific Class
-				      Endpoint 2 IN  interrupt - unsynchronized data [32 0]
-				    --------------
-				    Interface 03 Setup 00
-				      Vendor Specific Class
-				    --------------
-			*/
-			model = modelInfo{1, 0, 0, 1, 2, "360"}
-		default:
-			return false
-		}
-		return true
-	})
+	controller, err := NewController()
 	if err != nil {
-		log.Fatalf("listdevices: %s", err)
+		log.Fatalf("Failed to initialize controller: %v", err)
 	}
-	defer func() {
-		for _, d := range devs {
-			d.Close()
-		}
-	}()
-	if len(devs) != 1 {
-		log.Fatalf("found %d devices, want 1", len(devs))
-	}
-	controller := devs[0]
+	defer controller.Close()
 
-	if err := controller.Reset(); err != nil {
-		log.Fatalf("reset: %s", err)
+	if err := controller.Initialize(); err != nil {
+		log.Fatalf("Failed to initialize: %v", err)
 	}
 
-	in, err := controller.OpenEndpoint(
-		model.config,
-		model.iface,
-		model.setup,
-		model.endIn|uint8(usb.ENDPOINT_DIR_IN))
-	if err != nil {
-		log.Fatalf("in: openendpoint: %s", err)
-	}
+	sleepDuration := setPollingFrequency(*pollingFrequency)
+	log.Printf("Polling frequency set to %d Hz", *pollingFrequency)
+	log.Println("Xbox One controller connected and initialized")
 
-	out, err := controller.OpenEndpoint(
-		model.config,
-		model.iface,
-		model.setup,
-		model.endOut|uint8(usb.ENDPOINT_DIR_OUT))
-	if err != nil {
-		log.Fatalf("out: openendpoint: %s", err)
-	}
+	var lastState *ControllerState
 
-	switch {
-	case *readonly:
-		var b [512]byte
-		for {
-			n, err := in.Read(b[:])
-			log.Printf("read %d bytes: % x [err: %v]", n, b[:n], err)
-			if err != nil {
-				break
-			}
-		}
-	case model.kind == "360":
-		XBox360(controller, in, out)
-	case model.kind == "one":
-		XBoxOne(controller, in, out)
-	}
-}
-
-func XBox360(controller *usb.Device, in, out usb.Endpoint) {
-	// https://github.com/Grumbel/xboxdrv/blob/master/PROTOCOL
-
-	const (
-		Empty      byte = iota // 00000000 ( 0) no LEDs
-		WarnAll                // 00000001 ( 1) flash all briefly
-		NewPlayer1             // 00000010 ( 2) p1 flash then solid
-		NewPlayer2             // 00000011
-		NewPlayer3             // 00000100
-		NewPlayer4             // 00000101
-		Player1                // 00000110 ( 6) p1 solid
-		Player2                // 00000111
-		Player3                // 00001000
-		Player4                // 00001001
-		Waiting                // 00001010 (10) empty w/ loops
-		WarnPlayer             // 00001011 (11) flash active
-		_                      // 00001100 (12) empty
-		Battery                // 00001101 (13) squiggle
-		Searching              // 00001110 (14) slow flash
-		Booting                // 00001111 (15) solid then flash
-	)
-
-	led := func(b byte) {
-		out.Write([]byte{0x01, 0x03, b})
-	}
-
-	setPlayer := func(player byte) {
-		spin := []byte{
-			Player1, Player2, Player4, Player3,
-		}
-		spinIdx := 0
-		spinDelay := 100 * time.Millisecond
-
-		led(Booting)
-		time.Sleep(100 * time.Millisecond)
-		for spinDelay > 20*time.Millisecond {
-			led(spin[spinIdx])
-			time.Sleep(spinDelay)
-			spinIdx = (spinIdx + 1) % len(spin)
-			spinDelay -= 5 * time.Millisecond
-		}
-		for i := 0; i < 40; i++ { // just for safety
-			cur := spin[spinIdx]
-			led(cur)
-			time.Sleep(spinDelay)
-			spinIdx = (spinIdx + 1) % len(spin)
-			if cur == player {
-				break
-			}
-		}
-	}
-
-	led(Empty)
-	time.Sleep(1 * time.Second)
-	setPlayer(Player1)
-
-	var b [512]byte
 	for {
-		n, err := in.Read(b[:])
-		log.Printf("read %d bytes: % x [err: %v]", n, b[:n], err)
+		state, err := controller.ReadState()
 		if err != nil {
-			break
-		}
-	}
-
-	/*
-		time.Sleep(1 * time.Second)
-		setPlayer(Player2)
-		time.Sleep(1 * time.Second)
-		setPlayer(Player3)
-		time.Sleep(1 * time.Second)
-		setPlayer(Player4)
-		time.Sleep(5 * time.Second)
-		led(Waiting)
-	*/
-
-	var last, cur [512]byte
-	decode := func() {
-		n, err := in.Read(cur[:])
-		if err != nil || n != 20 {
-			log.Printf("ignoring read: %d bytes, err = %v", n, err)
-			return
+			log.Printf("Read error: %v", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
 
-		// 1-bit values
-		for _, v := range []struct {
-			idx  int
-			bit  uint
-			name string
-		}{
-			{2, 0, "DPAD U"},
-			{2, 1, "DPAD D"},
-			{2, 2, "DPAD L"},
-			{2, 3, "DPAD R"},
-			{2, 4, "START"},
-			{2, 5, "BACK"},
-			{2, 6, "THUMB L"},
-			{2, 7, "THUMB R"},
-			{3, 0, "LB"},
-			{3, 1, "RB"},
-			{3, 2, "GUIDE"},
-			{3, 4, "A"},
-			{3, 5, "B"},
-			{3, 6, "X"},
-			{3, 7, "Y"},
-		} {
-			c := cur[v.idx] & (1 << v.bit)
-			l := last[v.idx] & (1 << v.bit)
-			if c == l {
-				continue
-			}
-			switch {
-			case c != 0:
-				log.Printf("Button %q pressed", v.name)
-			case l != 0:
-				log.Printf("Button %q released", v.name)
-			}
-		}
-
-		// 8-bit values
-		for _, v := range []struct {
-			idx  int
-			name string
-		}{
-			{4, "LT"},
-			{5, "RT"},
-		} {
-			c := cur[v.idx]
-			l := last[v.idx]
-			if c == l {
-				continue
-			}
-			log.Printf("Trigger %q = %v", v.name, c)
-		}
-
-		dword := func(hi, lo byte) int16 {
-			return int16(hi)<<8 | int16(lo)
-		}
-
-		//     +y
-		//      N
-		// -x W-|-E +x
-		//      S
-		//     -y
-		dirs := [...]string{
-			"W", "SW", "S", "SE", "E", "NE", "N", "NW", "W",
-		}
-		dir := func(x, y int16) (string, int32) {
-			// Direction
-			rad := math.Atan2(float64(y), float64(x))
-			dir := 4 * rad / math.Pi
-			card := int(dir + math.Copysign(0.5, dir))
-
-			// Magnitude
-			mag := math.Sqrt(float64(x)*float64(x) + float64(y)*float64(y))
-			return dirs[card+4], int32(mag)
-		}
-
-		// 16-bit values
-		for _, v := range []struct {
-			hiX, loX int
-			hiY, loY int
-			name     string
-		}{
-			{7, 6, 9, 8, "LS"},
-			{11, 10, 13, 12, "RS"},
-		} {
-			c, cmag := dir(
-				dword(cur[v.hiX], cur[v.loX]),
-				dword(cur[v.hiY], cur[v.loY]),
-			)
-			l, lmag := dir(
-				dword(last[v.hiX], last[v.loX]),
-				dword(last[v.hiY], last[v.loY]),
-			)
-			ccenter := cmag < 10240
-			lcenter := lmag < 10240
-			if ccenter && lcenter {
-				continue
-			}
-			if c == l && cmag == lmag {
-				continue
-			}
-			if cmag > 10240 {
-				log.Printf("Stick %q = %v x %v", v.name, c, cmag)
-			} else {
-				log.Printf("Stick %q centered", v.name)
-			}
-		}
-
-		last, cur = cur, last
-	}
-
-	controller.ReadTimeout = 60 * time.Second
-	for {
-		decode()
-	}
-}
-
-func XBoxOne(controller *usb.Device, in, out usb.Endpoint) {
-	read := func() (tag, code byte, data []byte, err error) {
-		var b [64]byte
-
-		n, err := in.Read(b[:])
-		log.Printf("read %d bytes: % x [err: %v]", n, b[:n], err)
-
-		if err != nil {
-			return 0, 0, nil, err
-		}
-		if n < 2 {
-			return 0, 0, nil, fmt.Errorf("only read %d bytes", n)
-		}
-
-		return b[0], b[1], b[2:n], nil
-	}
-
-	write := func(data ...byte) error {
-		n, err := out.Write(data)
-		log.Printf("sent %d bytes: % x [err: %v]", n, data, err)
-		if n < len(data) {
-			return fmt.Errorf("only sent %d of %d bytes", n, len(data))
-		}
-		return err
-	}
-
-	dieIf := func(err error, format string, args ...interface{}) {
-		if err == nil {
-			return
-		}
-		msg := fmt.Sprintf(format, args...)
-		log.Fatalf("%s: %s", msg, err)
-	}
-
-	var err error
-
-	// Initializ
-	err = write(0x05, 0x20)
-	dieIf(err, "initialization")
-
-	decode := func(data []byte) {
-		if len(data) != 16 {
-			log.Printf("Only got %d bytes (want 16)", len(data))
-		}
-		var (
-			_    = data[0] // sequence number
-			_    = data[1] // unknown
-			btn1 = data[2] // ybxaSM?N S=share, M=Menu, N=Sync
-			btn2 = data[3] // rlrlRLDU r=R-Stick/Trigger, l=L-Stick/Trigger, R=D-Right, L=D-Left, D=D-Down, U=D-Up
-
-			lt = binary.LittleEndian.Uint16(data[4:6]) // left trigger, 0..1024
-			rt = binary.LittleEndian.Uint16(data[6:8]) // right trigger
-
-			lx = int16(binary.LittleEndian.Uint16(data[8:10]))  // left stick X, +/- 32768 or so
-			ly = int16(binary.LittleEndian.Uint16(data[10:12])) // left stick Y
-			rx = int16(binary.LittleEndian.Uint16(data[12:14])) // right stick X
-			ry = int16(binary.LittleEndian.Uint16(data[14:16])) // right stick Y
-		)
-
-		// btn1, least to most significant
-		for i, btn := range []string{
-			"SYNC", "BTN1|0x02", "MENU", "SHARE",
-			"A", "X", "B", "Y",
-		} {
-			if btn1&(1<<uint(i)) != 0 {
-				log.Print(btn)
-			}
-		}
-
-		// btn2, least to most significant
-		for i, btn := range []string{
-			"D-Up", "D-Down", "D-Left", "D-Right",
-			"L-Trigger", "R-Trigger", "L-Stick", "R-Stick",
-		} {
-			if btn2&(1<<uint(i)) != 0 {
-				log.Print(btn)
-			}
-		}
-
-		if lt > 0 || rt > 0 {
-			log.Println("LT:", lt, "RT:", rt)
-		}
-
-		abs := func(x int16) int16 {
-			if x < 0 {
-				return -x
-			}
-			return x
-		}
-		if abs(lx) > 4096 || abs(ly) > 4096 || abs(rx) > 4096 || abs(ry) > 4096 {
-			log.Println("Right:", lx, ly, "Left:", rx, ry)
-		}
-	}
-
-	for {
-		tag, _, data, _ := read()
-		switch tag {
-		case 0x07:
-			if len(data) != 4 {
-				log.Printf("Wanted %d bytes, got %d", 4, len(data))
-				break
-			}
-			if data[2]&0x01 != 0 {
-				log.Print("GUIDE")
-			}
-		case 0x20:
-			decode(data)
-		}
+		logStateChanges(state, lastState)
+		lastState = state
+		time.Sleep(sleepDuration)
 	}
 }
