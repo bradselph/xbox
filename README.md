@@ -1,16 +1,20 @@
-xbox
-====
-
-To test out my gousb driver, I'm playing around with the xbox controller USB protocol.
-
 To install this:
 
-    go get github.com/kylelemons/xbox
+```bash
+# Install dependencies
+go get github.com/google/gousb
 
-It should work with:
+# Build
+go build
 
-    RAZR Onza
-    Microsoft XBox Wired Controller
-    Microsoft XBox One (via microusb cable)
+# Run with default settings (500Hz polling)
+./xbox-controller
 
-You'll need to re-plug the controller before you run the binary, I haven't worked out the reset yet.
+# Or specify custom polling frequency
+./xbox-controller -freq 1000
+
+# Enable debugging
+./xbox-controller -debug 1
+```
+
+For Windows users, you'll need the libusb drivers installed. You can use Zadig (https://zadig.akeo.ie/) to install the drivers for your Xbox controller.
